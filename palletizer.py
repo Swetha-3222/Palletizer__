@@ -9,6 +9,8 @@ import pandas as pd
 import plotly.graph_objects as go
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
 # -------------------- Page --------------------
 st.set_page_config(page_title="Palletizer", layout="wide")
@@ -50,11 +52,23 @@ with st.sidebar:
     pallet_L = st.number_input("Pallet length (in)", value=float(DEFAULT_PALLET['L']))
     pallet_W = st.number_input("Pallet width (in)", value=float(DEFAULT_PALLET['W']))
     pallet_H = st.number_input("Pallet height (in)", value=float(DEFAULT_PALLET['H']))
+    
+    # ✅ NEW OPTIONAL INPUTS
+    st.markdown("#### Optional Customer Details")
+    customer_name = st.text_input("Customer Name (alphabets only)")
+    invoice_no = st.text_input("Invoice Number (whole numbers)")
+    po_ref_no = st.text_input("PO Reference Number (whole numbers)")
+
     scale = st.number_input("Scale factor (visual)", value=8, min_value=1)
     st.markdown("---")
-    st.markdown("Paste orders (Part, Qty) — one per line")
-    st.markdown("Example: E71531,870")
-    paste_text = st.text_area("Paste Orders (one per line, comma/tab/space separated)", height=240)
+    st.markdown("Paste orders **(Part, Qty, Package No)** — one per line")
+    st.markdown("Example: `E71531, 870, 100245`")
+
+    paste_text = st.text_area(
+        "Paste Orders (one per line, comma / tab / space separated)",
+        height=240
+    )
+    
     st.markdown("---")
     show_pdf = st.checkbox("Enable PDF download buttons", value=True)
     enable_reserve = st.checkbox("Enable reserve small remainders (legacy behavior)", value=False)
@@ -76,6 +90,30 @@ try:
 except Exception as e:
     st.warning(f"MASTER PART.xlsx not found or failed to load: {e}")
     PART_TO_BOX, BOX_TO_PARTS, ALL_PARTS = {}, {}, []
+
+# -------------------- Load AZ WEIGHT MASTER (by PART / SIZE) --------------------
+weight_file = os.path.join(os.path.dirname(__file__), "AZ WEIGHT MASTER.xlsx")
+
+try:
+    df_wt = pd.read_excel(weight_file)
+    df_wt.columns = [c.strip().upper() for c in df_wt.columns]
+
+    # Expecting columns: SIZE, GR WT, NT WT
+    if not {"SIZE", "GR WT", "NT WT"}.issubset(df_wt.columns):
+        raise ValueError("AZ WEIGHT MASTER.xlsx must contain SIZE, GR WT, NT WT columns")
+
+    WEIGHT_MAP = dict(
+        zip(
+            df_wt["SIZE"].astype(str).str.upper(),
+            zip(df_wt["GR WT"], df_wt["NT WT"])
+        )
+    )
+
+except Exception as e:
+    st.error(f"Failed to load AZ WEIGHT MASTER.xlsx: {e}")
+    WEIGHT_MAP = {}
+
+
 
 # -------------------- Colors --------------------
 if 'colors' not in st.session_state:
@@ -315,34 +353,62 @@ def pack_all_pallets_maxrects(pallet, boxes, order_counts, reserve_small=False):
 # -------------------- Parse pasted orders --------------------
 order_counts = {}
 order_part_queue = {}
+box_pkg_queue = {}   # box_code → list of package numbers (1 per box)
+
 for line in paste_text.splitlines():
     s = line.strip()
     if not s:
         continue
-    if ',' in s:
-        a, b = [t.strip() for t in s.split(',', 1)]
-    else:
-        parts = s.split()
-        if len(parts) >= 2:
-            a, b = parts[0].strip(), parts[1].strip()
-        else:
-            continue
-    a_up = a.upper()
-    if a_up in DEFAULT_BOXES:
-        st.warning(f"Detected box code '{a_up}' in pasted input. Please paste PART numbers only. This line was skipped.")
+
+    # allow comma / tab / space separation
+    tokens = [t.strip() for t in s.replace("\t", ",").split(",") if t.strip()]
+
+    if len(tokens) < 2:
+        st.warning(f"Invalid line skipped: {line}")
         continue
-    if a_up not in PART_TO_BOX:
-        st.warning(f"Unknown part '{a_up}' skipped.")
+
+    part = tokens[0]
+    qty = tokens[1]
+    
+
+    # Package number (optional, ignored for planning)
+    pkg_no = None
+    if len(tokens) >= 3:
+        try:
+            pkg_no = int(tokens[2])  # stored if needed later
+        except:
+            st.warning(f"Invalid package number ignored in line: {line}")
+
+    part_up = part.upper()
+
+    if part_up in DEFAULT_BOXES:
+        st.warning(
+            f"Detected box code '{part_up}' in pasted input. "
+            f"Please paste PART numbers only. This line was skipped."
+        )
         continue
+
+    if part_up not in PART_TO_BOX:
+        st.warning(f"Unknown part '{part_up}' skipped.")
+        continue
+
     try:
-        qty_units = int(float(b))
+        qty_units = int(float(qty))
     except:
         st.warning(f"Bad qty on line '{line}' — skipped.")
         continue
+
     boxes_needed = math.ceil(qty_units / MOQ)
-    box_code = normalize_box_name(PART_TO_BOX[a_up])
+    box_code = normalize_box_name(PART_TO_BOX[part_up])
+
     order_counts[box_code] = order_counts.get(box_code, 0) + boxes_needed
-    order_part_queue.setdefault(box_code, []).extend([a_up] * boxes_needed)
+    order_part_queue.setdefault(box_code, []).extend([part_up] * boxes_needed)
+
+    # NEW: generate unique package numbers per box
+    if pkg_no is not None:
+        box_pkg_queue.setdefault(box_code, [])
+        for i in range(boxes_needed):
+            box_pkg_queue[box_code].append(pkg_no + i)
 
 # ensure default boxes keys exist
 for b in DEFAULT_BOXES.keys():
@@ -352,6 +418,7 @@ for b in DEFAULT_BOXES.keys():
 if not any(v > 0 for v in order_counts.values()):
     st.info("No valid parts found from pasted orders. Paste PART numbers & quantities to pack.")
     st.stop()
+
 
 # -------------------- Prepare boxes_for_packing (allow rotation automatically handled by packer) --------------------
 boxes_for_packing = copy.deepcopy(DEFAULT_BOXES)
@@ -554,9 +621,112 @@ def create_layout_pdf_visuals(assigned_layer_details, pallet):
     c.save()
     return path
 
+def clear_values_after_row(ws, start_row=7, row_height=40):
+    max_row = ws.max_row
+    max_col = ws.max_column
+
+    # 1️⃣ Collect merged ranges to unmerge (only those touching rows >= start_row)
+    merged_ranges = list(ws.merged_cells.ranges)
+
+    for merged_range in merged_ranges:
+        min_row = merged_range.min_row
+        max_r = merged_range.max_row
+
+        if max_r >= start_row:
+            ws.unmerge_cells(str(merged_range))
+
+    # 2️⃣ Clear values + set row height
+    for r in range(start_row, max_row + 1):
+        ws.row_dimensions[r].height = row_height
+        for c in range(1, max_col + 1):
+            ws.cell(row=r, column=c).value = None
+
+def create_excel_report(
+    assigned_layers_per_pallet,
+    customer_name,
+    invoice_no,
+    po_ref_no
+):
+    template_path = os.path.join(os.path.dirname(__file__), "Report format.xlsx")
+    wb = load_workbook(template_path)
+
+    # First sheet is the template
+    template_ws = wb.worksheets[0]
+    template_ws.title = "Pallet 1"
+
+    global_box_no = 1  # BOX NO must continue across pallets
+
+    def write_pallet(ws, pallet_no, pallet_layers):
+        nonlocal global_box_no
+
+        # ---------------- Header ----------------
+        ws["F3"] = f"CUSTOMER NAME : {customer_name}"
+        ws["F4"] = f"INVOICE NO : {invoice_no}"
+        ws["F5"] = f"Pallet {pallet_no}"
+
+        start_row = 7
+        current_row = start_row
+
+        # ---------------- Table rows ----------------
+        for layer in pallet_layers:
+            for b in layer:
+                part = b.get("part", "").upper()
+
+                # Get PKG NO safely
+                box_code = b["name"]
+                pkg_no = ""
+                if box_code in box_pkg_queue and box_pkg_queue[box_code]:
+                    pkg_no = box_pkg_queue[box_code].pop(0)
+
+                gr, nt = WEIGHT_MAP.get(part, ("", ""))
+
+                ws.cell(row=current_row, column=6, value=global_box_no)  # BOX NO
+                ws.cell(row=current_row, column=7, value=pkg_no)         # PKGS NO
+                ws.cell(row=current_row, column=8, value=part)           # SIZE
+                ws.cell(row=current_row, column=9, value=MOQ)            # QTY
+                ws.cell(row=current_row, column=10, value=gr)            # GR WT
+                ws.cell(row=current_row, column=11, value=nt)            # NT WT
+                ws.cell(row=current_row, column=12, value=po_ref_no)     # PO REF
+
+                global_box_no += 1
+                current_row += 1
+
+        # ---------------- TOTAL row ----------------
+        total_row = current_row
+        total_pkgs = total_row - start_row
+
+        ws.insert_rows(total_row)
+
+        ws.merge_cells(start_row=total_row, start_column=6, end_row=total_row, end_column=8)
+        ws.cell(row=total_row, column=6, value=f"{total_pkgs} PKGS")
+
+        ws.cell(row=total_row, column=9, value=total_pkgs * MOQ)
+        ws.cell(row=total_row, column=10, value=f"=SUM(J{start_row}:J{total_row-1})")
+        ws.cell(row=total_row, column=11, value=f"=SUM(K{start_row}:K{total_row-1})")
+        ws.cell(row=total_row, column=12, value="")
+
+    # ---------------- Write Pallet 1 ----------------
+    write_pallet(template_ws, 1, assigned_layers_per_pallet[0])
+
+    # ---------------- Copy template for remaining pallets ----------------
+    for p_idx in range(2, len(assigned_layers_per_pallet) + 1):
+        ws_new = wb.copy_worksheet(template_ws)
+        ws_new.title = f"Pallet {p_idx}"
+        clear_values_after_row(ws_new, start_row=7, row_height=40)
+        write_pallet(ws_new, p_idx, assigned_layers_per_pallet[p_idx - 1])
+
+    # ---------------- Save output ----------------
+    out_path = tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix="_Invoice_Report.xlsx"
+    ).name
+
+    wb.save(out_path)
+    return out_path
+
 # -------------------- Top bar & PDF buttons --------------------
 st.markdown("---")
-top_cols = st.columns([2, 4, 1.2, 1.2])
+top_cols = st.columns([2, 4, 1.2, 1.2, 1.4])
 with top_cols[0]:
     st.markdown(f"<div style='display:flex; align-items:center; gap:8px;'><h4 style='margin:0;'>✅ Total pallets used: {total_pallets}</h4></div>", unsafe_allow_html=True)
 with top_cols[1]:
@@ -577,6 +747,25 @@ with top_cols[3]:
                 st.download_button("📝 Download Summary PDF", f, file_name=os.path.basename(summary_pdf_path), mime="application/pdf")
         except Exception as e:
             st.error(f"Error preparing Summary PDF: {e}")
+
+with top_cols[4]:
+    try:
+        report_path = create_excel_report(
+            assigned_layers_per_pallet,
+            customer_name,
+            invoice_no,
+            po_ref_no
+        )
+        with open(report_path, "rb") as f:
+            st.download_button(
+                "📊 Download Report",
+                f,
+                file_name=os.path.basename(report_path),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+    except Exception as e:
+        st.error(f"Report generation failed: {e}")
+
 st.markdown("---")
 
 # -------------------- Show Pallets & Layers --------------------
